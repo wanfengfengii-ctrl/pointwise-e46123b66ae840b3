@@ -1,13 +1,20 @@
+from lake.audit.continuation import ContinuationNotFound as ContinuationNotFound
+from lake.audit.continuation import read_signed_continuation
 from lake.audit.coverage import CoveredRow
 from lake.audit.statement import Statement
 from lake.delivery.receipts import Receipt
 from lake.release.balances import ReadingBalance
 from lake.release.partitions import frozen_row_from_fields
-from lake.storage import NotFound, decode_reading, positive_number
+from lake.storage import NotFound, decode_reading, identifier, positive_number
 
 
 class StatementNotFound(NotFound):
     pass
+
+
+def read_continuation(center, continuation_id):
+    identifier(continuation_id, 'continuation_id')
+    return read_signed_continuation(center, continuation_id)
 
 
 def read_statement(center, statement_id):

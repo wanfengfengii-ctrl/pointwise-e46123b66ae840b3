@@ -8,8 +8,11 @@ import sqlite3
 import sys
 from tempfile import TemporaryDirectory
 
-from lake.audit.readback import read_statement
-from lake.audit.statement import initialize_statements, issue_statement
+from lake.audit.continuation import (
+    initialize_center_continuations, initialize_receiver_continuations, read_active_continuation,
+)
+from lake.audit.readback import read_continuation, read_statement
+from lake.audit.statement import initialize_statements, issue_continuation, issue_statement
 from lake.delivery.attempts import initialize_attempts, load_attempt, read_job_status, send
 from lake.delivery.outcomes import AttemptStatus
 from lake.delivery.receipts import initialize_receipts
@@ -51,7 +54,9 @@ def initialize_workspace(path):
         initialize_assignments(center)
         initialize_receipts(center)
         initialize_statements(center)
+        initialize_center_continuations(center)
         initialize_receiver(receiver)
+        initialize_receiver_continuations(receiver)
     return workspace
 
 
@@ -78,6 +83,9 @@ _OPERATIONS = {
     'reconcile': (reconcile, (0, 1)),
     'issue-statement': (issue_statement, (0,)),
     'read-statement': (read_statement, (0,)),
+    'issue-continuation': (issue_continuation, (0, 1)),
+    'read-continuation': (read_continuation, (0,)),
+    'active-partition': (read_active_continuation, (1,)),
     'job-status': (read_job_status, (0,)),
     'receiver-log': (read_receiver_log, (1,)),
     'receiver-outcome': (_receiver_outcome, (0, 1)),
@@ -123,6 +131,111 @@ def _scenario(case_id, data, expected, actual, downstream_expected, downstream_a
         'downstream_expected': downstream_expected, 'downstream_actual': downstream_actual,
         'code_paths': paths, 'oracle': oracle,
     }))
+
+
+def _continuation_demo(target):
+    """Show a corrected continuation through a center-signing failure and reopen."""
+    with TemporaryDirectory(prefix='linting-continuation-') as path:
+        return _continuation_scenario(path, target)
+
+
+def _continuation_scenario(path, target):
+    from continuation_examples import deliver_c, prepare_example, require_denied_commit
+    from lake.audit.continuation import read_active_continuation
+    from lake.storage import Conflict
+
+    with initialize_workspace(path).connect() as (center, receiver):
+        example = prepare_example(center, receiver)
+        request = example.request()
+        before = issue_continuation(center, receiver, **request)
+        _demo_equal('continuation pending', before, {'status': 'pending', 'missing_lines': [1]})
+        _demo_equal('target uncontinued', read_active_continuation(
+            receiver, target, example.parent.statement_id), {'status': 'uncontinued'})
+        deliver_c(center, receiver, example, hide_reply=True)
+        _demo_equal('staged arrivals', [
+            entry.receipt.attempt_id for entry in read_receiver_log(receiver, target)
+        ], ['parent-A', 'parent-B', 'archive-C'])
+
+        require_denied_commit(center, lambda: issue_continuation(center, receiver, **request))
+        _demo_equal('no center continuation after failed commit',
+                    center.execute('SELECT COUNT(*) FROM continuations').fetchone()[0], 0)
+
+    with initialize_workspace(path).connect() as (center, receiver):
+        target_confirmation = read_active_continuation(receiver, target, example.parent.statement_id)
+        _demo_equal('target keeps confirmation', target_confirmation['status'], 'confirmed')
+        rejections = []
+        for overrides in (
+            {'request_id': 'correction-other',
+             'child_release_id': example.competing_child.release_id},
+            {'child_release_id': example.competing_child.release_id},
+        ):
+            conflicting = dict(request, **overrides)
+            try:
+                issue_continuation(center, receiver, **conflicting)
+            except Conflict as exc:
+                rejections.append(type(exc).__name__)
+            else:
+                raise LakeError('a competing continuation was accepted')
+        signed = issue_continuation(center, receiver, **request)
+        _demo_equal('continuation replay', issue_continuation(center, receiver, **request), signed)
+        stored = read_continuation(center, signed['continuation_id'])
+        _demo_equal('confirmation shared', stored['confirmation'], target_confirmation['confirmation'])
+        _demo_equal('continuation replay', read_continuation(
+            center, signed['continuation_id']), stored)
+        confirmation = stored['confirmation']
+        expected_rows = {
+            'lines': [1, 2], 'kinds': ['received', 'reused'],
+            'attempts': ['archive-C', 'parent-A'],
+        }
+        actual_rows = {
+            'lines': [item['row']['key']['line'] for item in confirmation['rows']],
+            'kinds': [item['kind'] for item in confirmation['rows']],
+            'attempts': [item['receipt']['attempt_id'] for item in confirmation['rows']],
+        }
+        _demo_equal('child order and receipts', actual_rows, expected_rows)
+        _demo_equal('retired parent row', [
+            (item['row']['key']['line'], item['receipt']['attempt_id'])
+            for item in confirmation['retired_rows']
+        ], [(2, 'parent-B')])
+        _demo_equal('continuation balance', confirmation['balance'],
+                    {'row_count': 2, 'missing_count': 0, 'total': 16})
+        _demo_equal('old statement unchanged', read_statement(
+            center, example.parent.statement_id), example.parent)
+        _demo_equal('actual flow unchanged', [
+            entry.receipt.attempt_id for entry in read_receiver_log(receiver, target)
+        ], ['parent-A', 'parent-B', 'archive-C'])
+        old_statement = read_statement(center, example.parent.statement_id)
+        print('CONTINUATION_DEMO ' + _json({
+            'continuation_id': signed['continuation_id'],
+            'target_active_partition': {
+                'status': 'confirmed',
+                'balance': confirmation['balance'],
+                'rows': actual_rows,
+                'retired_rows': [
+                    {'line': item['row']['key']['line'],
+                     'attempt_id': item['receipt']['attempt_id']}
+                    for item in confirmation['retired_rows']
+                ],
+            },
+            'old_statement': {
+                'statement_id': old_statement.statement_id,
+                'balance': asdict(old_statement.balance),
+                'attempts': [entry.receipt.attempt_id for entry in old_statement.rows],
+            },
+        }))
+        _scenario(
+            'continuation',
+            {'request': request, 'child': [('C', 11), ('A', 5)],
+             'parent': [('A', 5), ('B', 11)], 'rejected': rejections},
+            {'status': 'issued', 'continuation_id': signed['continuation_id']},
+            {'status': 'issued',
+             'continuation_id': read_continuation(center, signed['continuation_id'])['continuation_id']},
+            expected_rows, actual_rows,
+            ['lake/audit/continuation.py', 'lake/audit/statement.py',
+             'lake/audit/readback.py', 'lake/delivery/receiver.py'],
+            'Reuse parent-A for the unchanged A reading at child line 2; take archive-C for '
+            'child line 1; retire parent line 2 (B); add 11 + 5.')
+    return stored
 
 
 def _demo():
@@ -190,6 +303,7 @@ def _demo():
                       ['lake/dispatch/handoff.py', 'lake/delivery/receiver.py', 'lake/delivery/reconcile.py',
                        'lake/audit/statement.py', 'lake/audit/readback.py'],
                       'Use the original A attempt for line 1 and the B attempt for line 2, in frozen order. Add 5 + 11.')
+        _continuation_demo(target)
     return stored
 
 

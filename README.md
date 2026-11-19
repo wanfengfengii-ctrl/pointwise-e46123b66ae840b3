@@ -45,3 +45,19 @@ python3 -B -m lake.audit.workday --workspace ./example-workday read-statement '{
 - `issue_statement` 在全部覆盖齐备后提交快照，`read_statement` 按原号获取原冻结顺序、读数、出处、回执及统计。源批新增修订及原回执重投不改变清单。
 
 Python 可通过 `lake.audit.workday.initialize_workspace(path)` 获取工作区，再用 `with workspace.connect() as (center, receiver)` 打开连接。九个业务函数分别在 `lake.intake.batches`、`lake.release.freeze`、`lake.release.history`、`lake.dispatch.jobs`、`lake.dispatch.handoff`、`lake.delivery.attempts`、`lake.delivery.reconcile`、`lake.audit.statement` 和 `lake.audit.readback` 中定义。中心接口首参数为 `center`，`send` 与 `reconcile` 另接 `receiver` 为第二参数。API 返回数据类或不可变序列。业务异常属于 `lake.storage.LakeError`，CLI 将异常类别和消息写入标准错误并返回 2，存储或文件错误返回 3。
+
+## 更正接续
+
+已签普通清单固定了原行和实际回执。更正发布可能调换原行顺序、删行或换用另一来源，档案方需要一份新的有效口径，同时旧单仍按原号复核。接续的业务规则见 `CONTINUATIONS.md`。
+
+```sh
+python3 -B -m lake.audit.workday --workspace ./example-workday issue-continuation '{"target":"archive","request_id":"correction-1","parent_statement_id":1,"child_release_id":2,"partition":"east"}'
+python3 -B -m lake.audit.workday --workspace ./example-workday active-partition '{"target":"archive","parent_statement_id":1}'
+python3 -B -m lake.audit.workday --workspace ./example-workday read-continuation '{"continuation_id":"continuation-1"}'
+```
+
+- `issue_continuation(center, receiver, target, request_id, parent_statement_id, child_release_id, partition)` 先按父单和子发布核对。未齐返回 `{"status": "pending", "missing_lines": [...]}`，此时请求号未占用、父账仍有效；齐备时目标在一次本地提交中确认整份子账并消耗父单，中心再据该确认签结，返回 `{"status": "issued", "continuation_id": ...}`。
+- `read_active_partition(receiver, target, parent_statement_id)` 只读目标库，返回 `uncontinued` 或该目标的首执。
+- `read_continuation(center, continuation_id)` 只读中心库，按接续单号返回同一首执。
+
+沿用判断只看冻结出处：站点、日期、修订、批内原位和读值均相同即沿用父回执，冻结行号移位不影响。其余子行必须由该目标实际收下该子发布的同一冻结行；同值异源不算。未沿用的父行按父单原序列为退出，保留原行和原回执，旧 V1 清单和实际流水不变。已确认的同号异参及另号接续已消费父单均拒绝；中心签结提交失败后重开两库，同号同申请取目标原确认补签，再投返回同一接续单号。

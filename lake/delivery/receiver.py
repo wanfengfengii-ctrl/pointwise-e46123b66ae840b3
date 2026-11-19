@@ -4,7 +4,7 @@ import json
 from lake.delivery.outcomes import AttemptStatus, OutcomeConflict, ReceiverOutcome, parse_status
 from lake.delivery.receipts import Receipt
 from lake.release.partitions import FrozenRow, frozen_row_fields, frozen_row_from_fields
-from lake.storage import BadInput, Conflict, NotFound, identifier, write_transaction
+from lake.storage import BadInput, Conflict, NotFound, identifier, positive_number, write_transaction
 
 
 @dataclass(frozen=True)
@@ -147,3 +147,11 @@ def read_receiver_log(receiver, target):
         row = frozen_row_from_fields(*json.loads(payload))
         received.append(ReceivedRow(row, Receipt(receipt_id, target, attempt_id, row.key)))
     return tuple(received)
+
+
+def read_active_partition(receiver, target, parent_statement_id):
+    from lake.audit.continuation import read_active_continuation
+
+    identifier(target, 'target')
+    positive_number(parent_statement_id, 'parent_statement_id')
+    return read_active_continuation(receiver, target, parent_statement_id)
